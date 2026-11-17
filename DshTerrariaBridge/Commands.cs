@@ -872,6 +872,8 @@ namespace DshTerrariaBridge
                     weaponSlot = BridgeSystem.GuardWeaponSlot,
                 };
                 data["attack"] = BridgeSystem.AttackStatus();
+                // 谁在开车、谁被谁挡住：排查"命令回 ok 但人不动"的第一手证据。
+                data["drive"] = BridgeSystem.DriveStatus();
                 data["path"] = new
                 {
                     active = BridgeSystem.PathActive,
@@ -889,6 +891,19 @@ namespace DshTerrariaBridge
                     repaths = BridgeSystem.WalkRepaths,
                     stuck = BridgeSystem.WalkStuckTicks,
                     pathWhy = BridgeSystem.LastPathWhy,
+                    // 单步判定的现场：卡住时先看这里，别猜。
+                    step = new
+                    {
+                        index = BridgeSystem.WalkDbgIndex,
+                        cells = BridgeSystem.WalkDbgCells,
+                        from = new { x = BridgeSystem.WalkDbgPx, y = BridgeSystem.WalkDbgPy },
+                        next = new { x = BridgeSystem.WalkDbgNextX, y = BridgeSystem.WalkDbgNextY },
+                        sign = BridgeSystem.WalkDbgSign,
+                        rise = BridgeSystem.WalkDbgRise,
+                        blocked = BridgeSystem.WalkDbgBlocked,
+                        air = new[] { BridgeSystem.WalkDbgAir0, BridgeSystem.WalkDbgAir1, BridgeSystem.WalkDbgAir2 },
+                        airNote = "air[0..2] = 前瞻格 py / py+1 / py+2 是否可通行（1=可）；blocked=true 且 air[0]=0 表示身体那一格有实心",
+                    },
                     follow = new
                     {
                         active = BridgeSystem.FollowActive,
@@ -998,6 +1013,9 @@ namespace DshTerrariaBridge
             int cy = Json.Int(p, "y", (int)(pl.Center.Y / 16f));
             int rad = Math.Clamp(Json.Int(p, "r", 24), 1, 48);
             int minDepth = Math.Clamp(Json.Int(p, "minDepth", 6), 2, 40);
+            // 井口上方要有多大的敞口才算"能掉进去的坑"。默认 6 格：人三格高，站在上方
+            // 走两步就会掉进去；被实心顶盖住的竖井是地下洞穴，从地表走不到，不该报成坑。
+            int openAbove = Math.Clamp(Json.Int(p, "openAbove", 6), 0, 32);
             int x0 = cx - rad, y0 = cy - rad, w = rad * 2 + 1, h = rad * 2 + 1;
 
             var raw = new List<int[]>();   // x, top, depth, floorY, wallL, wallR
@@ -1019,12 +1037,28 @@ namespace DshTerrariaBridge
                     int bottom = top + d;
                     if (d >= minDepth && InBounds(x, bottom) && SolidAt(x, bottom))
                     {
-                        int mid = top + d / 2;
-                        int lw = 0, rw = 0;
-                        for (int k = mid; k < bottom; k++) { if (SolidAt(x - 1, k)) lw++; else break; }
-                        for (int k = mid; k < bottom; k++) { if (SolidAt(x + 1, k)) rw++; else break; }
-                        int need = Math.Max(2, d / 2);
-                        if (Math.Max(lw, rw) >= need) raw.Add(new[] { x, top, d, bottom, lw, rw });
+                        // ① 敞口：井口往上连续空多少格。封顶的一律不算坑。
+                        int roofGap = 0;
+                        for (int k = 1; k <= openAbove; k++)
+                        {
+                            if (!InBounds(x, top - k) || SolidAt(x, top - k)) break;
+                            roofGap++;
+                        }
+                        // ② 平台夹层：坑底是平台（tileSolidTop 而非 tileSolid）＝站在上面的地板，
+                        //    不是"掉下去的坑"。这种会成片误报，直接排除。
+                        bool floorIsPlatform = InBounds(x, bottom)
+                            && Main.tile[x, bottom].HasTile
+                            && Main.tileSolidTop[Main.tile[x, bottom].TileType]
+                            && !Main.tileSolid[Main.tile[x, bottom].TileType];
+                        if (roofGap >= openAbove && !floorIsPlatform)
+                        {
+                            int mid = top + d / 2;
+                            int lw = 0, rw = 0;
+                            for (int k = mid; k < bottom; k++) { if (SolidAt(x - 1, k)) lw++; else break; }
+                            for (int k = mid; k < bottom; k++) { if (SolidAt(x + 1, k)) rw++; else break; }
+                            int need = Math.Max(2, d / 2);
+                            if (Math.Max(lw, rw) >= need) raw.Add(new[] { x, top, d, bottom, lw, rw });
+                        }
                     }
                     j += Math.Max(d, 1) - 1;
                 }
@@ -1032,7 +1066,7 @@ namespace DshTerrariaBridge
 
             // 相邻列合并成"井口"
             raw.Sort((a, b) => a[0] != b[0] ? a[0] - b[0] : b[2] - a[2]);
-            var groups = new List<int[]>();   // x0, x1, depth, floorY
+            var groups = new List<int[]>();   // x0, x1, depth, floorY, topY
             foreach (var q in raw)
             {
                 if (groups.Count > 0)
@@ -1042,23 +1076,42 @@ namespace DshTerrariaBridge
                     {
                         g[1] = q[0];
                         if (q[2] > g[2]) { g[2] = q[2]; g[3] = q[3]; }
+                        g[4] = Math.Min(g[4], q[1]);
                         continue;
                     }
                 }
-                groups.Add(new[] { q[0], q[0], q[2], q[3] });
+                groups.Add(new[] { q[0], q[0], q[2], q[3], q[1] });
             }
 
-            var pits = new List<object>();
+            // 距离要算二维：只报水平距离会把地下 30 格的井说成"距 5 格"，
+            // 于是"最近的坑"永远指向一个地表走不到的地方。排完序再装箱。
+            var rows = new List<int[]>();   // x0, x1, center, topY, depth, floorY, dist, dy
             foreach (var g in groups)
             {
                 int gx = (g[0] + g[1]) / 2;
-                pits.Add(new { x0 = g[0], x1 = g[1], center = gx, depth = g[2], floorY = g[3], dist = Math.Abs(gx - cx) });
+                int dy = g[4] - cy;
+                int dist = (int)Math.Round(Math.Sqrt((double)(gx - cx) * (gx - cx) + (double)dy * dy));
+                rows.Add(new[] { g[0], g[1], gx, g[4], g[2], g[3], dist, dy });
+            }
+            rows.Sort((a, b) => a[6].CompareTo(b[6]));
+
+            var pits = new List<object>();
+            foreach (int[] r in rows)
+            {
+                pits.Add(new
+                {
+                    x0 = r[0], x1 = r[1], center = r[2],
+                    topY = r[3], depth = r[4], floorY = r[5],
+                    dist = r[6], dy = r[7],
+                    reachableFromSurface = r[7] >= -2,
+                });
             }
             return Json.Ok(new
             {
                 center = new { x = cx, y = cy },
                 r = rad,
                 minDepth,
+                openAbove,
                 count = pits.Count,
                 pits,
                 note = count_note(pits.Count, minDepth),
@@ -3677,17 +3730,115 @@ namespace DshTerrariaBridge
             return BridgeSystem.TravelStatus();
         }
 
+        /* ── 目标抽象（walkto 的 mode）────────────────────────────────────
+         * 病根：walkto 只认精确 {x,y}，那格不能站就拒，于是"走到 x≈2000 附近任意能站的格子"
+         * 这种最常见的意图表达不出来，表现成"目标不可站"和 no-path。
+         * 结构照 Baritone 的 Goal 家族：block / near / xz / ylevel / any / away。
+         * 目标先 Resolve 成一个真的能站的格子，再交给原来的 A* —— 寻路一行没改。
+         */
+        private static Goal BuildGoal(JsonElement p, out string err)
+        {
+            err = null;
+            string mode = (Json.Str(p, "mode", "block") ?? "block").Trim().ToLowerInvariant();
+            int tol = Math.Clamp(Json.Int(p, "tol", 1), 0, 32);
+            int x = Json.Int(p, "x", int.MinValue), y = Json.Int(p, "y", int.MinValue);
+
+            if (mode == "block" && x != int.MinValue && y != int.MinValue) return new GoalBlock(x, y, tol);
+            if (mode == "near")
+            {
+                if (x == int.MinValue || y == int.MinValue) { err = "mode:near 需要 x,y"; return null; }
+                return new GoalBlock(x, y, tol);
+            }
+            if (mode == "xz")
+            {
+                if (x == int.MinValue) { err = "mode:xz 需要 x（y 随便给，会忽略）"; return null; }
+                return new GoalX(x, tol);
+            }
+            if (mode == "ylevel")
+            {
+                if (y == int.MinValue) { err = "mode:ylevel 需要 y"; return null; }
+                return new GoalYLevel(y, tol);
+            }
+            if (mode == "away")
+            {
+                if (x == int.MinValue || y == int.MinValue) { err = "mode:away 需要 x,y（从这点逃开）"; return null; }
+                return new GoalAway(x, y, Math.Max(2, Json.Int(p, "minDist", 8)));
+            }
+            if (mode == "any")
+            {
+                Json.Seen("targets");
+                if (p.ValueKind != JsonValueKind.Object || !p.TryGetProperty("targets", out JsonElement arr)
+                    || arr.ValueKind != JsonValueKind.Array)
+                { err = "mode:any 需要 targets:[{x,y},...]"; return null; }
+                var parts = new List<Goal>();
+                foreach (JsonElement e in arr.EnumerateArray())
+                {
+                    if (e.ValueKind != JsonValueKind.Object) continue;
+                    int gx = Json.Int(e, "x", int.MinValue), gy = Json.Int(e, "y", int.MinValue);
+                    if (gx == int.MinValue || gy == int.MinValue) continue;
+                    int gt = Json.Int(e, "tol", tol);
+                    parts.Add(new GoalBlock(gx, gy, gt));
+                }
+                if (parts.Count == 0) { err = "targets 里没有有效的 {x,y}"; return null; }
+                return new GoalComposite(parts);
+            }
+            err = $"不认识的 mode：{mode}（可用 block / near / xz / ylevel / any / away）";
+            return null;
+        }
+
         private static string WalkTo(JsonElement p)
         {
             if (!InWorld(out string err)) return Json.Error(err);
             if (!HasPlayer(out string perr)) return Json.Error(perr);
+            Player pl = P;
+            int px = (int)(pl.Center.X / 16f), py = (int)(pl.Center.Y / 16f);
+            int tol = Math.Clamp(Json.Int(p, "tol", 1), 0, 32);
+            bool walkForce = Json.Bool(p, "force", false);
+            bool hasGoalMode = Json.Has(p, "mode");
+
+            if (hasGoalMode)
+            {
+                Goal goal = BuildGoal(p, out string gerr);
+                if (goal == null) return Json.Error(gerr);
+                if (goal.IsAt(px, py))
+                    return Json.Ok(new
+                    {
+                        already = true, goal = goal.Describe(), at = new { x = px, y = py },
+                        heuristic = Math.Round(goal.Heuristic(px, py), 1),
+                        note = "已经满足这个目标，没有发任何输入",
+                    });
+                int searchR = Math.Clamp(Json.Int(p, "searchR", 24), 2, 48);
+                if (!goal.Resolve(px, py, searchR, out int gx, out int gy))
+                    return Json.Error(
+                        $"目标 {goal.Describe()} 在 ±{searchR} 格内找不到能站的格子。"
+                        + "放宽 tol / 加大 searchR，或换个目标（先用 scan {format:'regions'} 看这一带通不通）。",
+                        new { goal = goal.Describe(), from = new { x = px, y = py }, searchR });
+                int ms0 = Json.Int(p, "ms", 180000);
+                BridgeSystem.PathAllowDig = Json.Bool(p, "dig", false);
+                BridgeSystem.PathGreedy = false;
+                BridgeSystem.PathProtectBuilds = true;
+                if (!BridgeSystem.BeginWalk(gx, gy, tol, BridgeSystem.Now + BridgeSystem.Ticks(ms0)))
+                    return Json.Error(
+                        "没拿到走路驱动权，当前被更高优先级占着（多半是手动键还按着）。"
+                        + "等一两秒再发，或先 stop。",
+                        new { goal = goal.Describe(), resolved = new { x = gx, y = gy }, drive = BridgeSystem.DriveStatus() });
+                return Json.Ok(new
+                {
+                    goal = goal.Describe(),
+                    resolved = new { x = gx, y = gy },
+                    from = new { x = px, y = py },
+                    tol, ms = ms0,
+                    heuristic = Math.Round(goal.Heuristic(px, py), 1),
+                    note = "目标已落成一个能站的格子；A* 走的是这个格子，不是原始目标",
+                });
+            }
+
             int x = Json.Int(p, "x", -1), y = Json.Int(p, "y", -1);
-            if (x < 0 || y < 0) return Json.Error("walkto 需要 x,y");
+            if (x < 0 || y < 0) return Json.Error("walkto 需要 x,y（或给 mode:near|xz|ylevel|any|away）");
             // 目标格先验：不能站的格子 A* 一定算不出路，最后只回一句 no-path，
             // 看起来像"左边没路/被墙挡住"（实测把 8 格深的坑口当成"走不过去"）。
             // 默认拒绝并给出最近可站点；force:true 跳过校验。
-            bool walkForce = Json.Bool(p, "force", false);
-            if (!walkForce && (!BridgeSystem.PathBodyFree(x, y) || !BridgeSystem.PathFloorAt(x, y)))
+            if (!walkForce && !Goal.Standable(x, y))
             {
                 int bx = -1, by = -1, best = int.MaxValue;
                 for (int dy = -8; dy <= 8; dy++)
@@ -3695,8 +3846,7 @@ namespace DshTerrariaBridge
                     for (int dx = -8; dx <= 8; dx++)
                     {
                         int nx = x + dx, ny = y + dy;
-                        if (!BridgeSystem.PathBodyFree(nx, ny)) continue;
-                        if (!BridgeSystem.PathFloorAt(nx, ny)) continue;
+                        if (!Goal.Standable(nx, ny)) continue;
                         int d = Math.Abs(dx) + Math.Abs(dy);
                         if (d < best) { best = d; bx = nx; by = ny; }
                     }
@@ -3704,14 +3854,14 @@ namespace DshTerrariaBridge
                 if (bx < 0)
                     return Json.Error(
                         $"walkto 的目标 ({x},{y}) 不能站立：身体格被挡或脚下没有地板，附近 8 格内也没找到可站的格子。"
-                        + "先用 scan {format:'regions'} 看 standable / verdict，或 tile {x,y} 确认那里是什么。",
+                        + "先用 scan {format:'regions'} 看 standable / verdict，或 tile {x,y} 确认那里是什么；"
+                        + "只想走到「那一带」就改用 mode:near / mode:xz。",
                         new { target = new { x, y }, bodyFree = BridgeSystem.PathBodyFree(x, y), floorAt = BridgeSystem.PathFloorAt(x, y) });
                 return Json.Error(
                     $"walkto 的目标 ({x},{y}) 不能站立；最近能站的是 ({bx},{by})，距 {best} 格。"
-                    + $"改用 walkto {{x:{bx},y:{by}}}；如果确实要去那个格子（例如要掉进去），传 force:true。",
+                    + $"改用 walkto {{x:{bx},y:{by}}} 或 mode:near；如果确实要去那个格子（例如要掉进去），传 force:true。",
                     new { target = new { x, y }, nearest = new { x = bx, y = by, dist = best } });
             }
-            int tol = Json.Int(p, "tol", 1);
             // 默认 15 秒对"穿两间房 + 上屋顶 + 绕路"这种 90 多步的路线远远不够：
             // 实测 94 步走到第 60 步就撞死线，回包只说 timeout，看着像"卡住"。
             // 真正的兜底靠停滞检测（WalkStuck），死线只是防跑飞，所以放到 3 分钟。
@@ -3722,7 +3872,10 @@ namespace DshTerrariaBridge
             BridgeSystem.PathAllowDig = Json.Bool(p, "dig", false);
             BridgeSystem.PathGreedy = false;   // 每次 walkto 从规划模式开始，算不出才退贪心
             BridgeSystem.PathProtectBuilds = true;
-            BridgeSystem.BeginWalk(x, y, tol, BridgeSystem.Now + BridgeSystem.Ticks(ms));
+            if (!BridgeSystem.BeginWalk(x, y, tol, BridgeSystem.Now + BridgeSystem.Ticks(ms)))
+                return Json.Error(
+                    "没拿到走路驱动权，当前被更高优先级占着（多半是手动键还按着）。等一两秒再发，或先 stop。",
+                    new { target = new { x, y }, drive = BridgeSystem.DriveStatus() });
             return Json.Ok(new { target = new { x, y }, tol, ms });
         }
 
@@ -4060,7 +4213,8 @@ namespace DshTerrariaBridge
             if (!HasPlayer(out string perr)) return Json.Error(perr);
             if (!CanTick(out string perr2)) return Json.Error(perr2);
             BridgeSystem.StopAutomatedMovement("moveto");
-            BridgeSystem.GuardUntil = 0; BridgeSystem.GuardDefault = false; BridgeSystem.GuardEngaged = false;
+            BridgeSystem.GuardEngaged = false;   // 松手但不销毁 guard（见 Move 的注释）
+            BridgeSystem.Acquire(BridgeSystem.Drive.Manual, "moveto", BridgeSystem.Now + BridgeSystem.Ticks(16000));
             float x = Json.Float(p, "x", float.NaN);
             if (float.IsNaN(x)) return Json.Error("moveto 需要 x（目标格坐标，可以是小数）");
             int ms = Math.Clamp(Json.Int(p, "ms", 4000), 200, 15000);
@@ -4206,14 +4360,18 @@ namespace DshTerrariaBridge
             // 手动方向必须抢回控制权：walkto 卡住时 Travel.Active 还是 true，
             // 它每帧覆盖方向键，手动 left/right 会被完全吃掉（实测连发 14 次一动不动）。
             BridgeSystem.StopAutomatedMovement("manual-move");
-            // guard 每帧会自己转向/切武器/按开火，会把手动操作吃掉；手动指令一律先解除它。
-            BridgeSystem.GuardUntil = 0; BridgeSystem.GuardDefault = false; BridgeSystem.GuardEngaged = false;
+            // 以前这里还把 guard 三连清零（GuardUntil / GuardDefault / GuardEngaged）。
+            // 后果是"走两步 = 永久关掉自动防守"，于是怪贴脸还站着不动 —— 这是被用户
+            // 连着骂的那个现象的一半原因。现在改成抢驱动权：guard 只是在这段窗口内让路，
+            // 手动窗口一过它自己接着工作（见 BridgeSystem 的 Drive 仲裁）。
+            BridgeSystem.GuardEngaged = false;
             string dir = (Json.Str(p, "dir", "right") ?? "right").ToLowerInvariant();
             int ms = Math.Clamp(Json.Int(p, "ms", 500), 1, 5000);
             if (dir != "left" && dir != "right" && dir != "up" && dir != "down")
                 return Json.Error($"dir 只能是 left/right/up/down，收到 {dir}");
             float tiles = Json.Float(p, "tiles", 0f);
             ulong until = BridgeSystem.Now + BridgeSystem.Ticks(ms);
+            BridgeSystem.Acquire(BridgeSystem.Drive.Manual, "move:" + dir, until + BridgeSystem.Ticks(600));
             var from = new[] { MathF.Round(P.Center.X / 16f, 1), MathF.Round(P.Center.Y / 16f, 1) };
             bool upInputOnly = dir == "up"
                 && !BridgeSystem.OnRopeNow(P)
@@ -4301,7 +4459,8 @@ namespace DshTerrariaBridge
         private static string Jump(JsonElement p)
         {
             BridgeSystem.StopAutomatedMovement("manual-jump");   // 同上：手动动件必须抢回控制权
-            BridgeSystem.GuardUntil = 0; BridgeSystem.GuardDefault = false;
+            BridgeSystem.GuardEngaged = false;                   // 只松手，不销毁 guard（见 Move 的注释）
+            BridgeSystem.Acquire(BridgeSystem.Drive.Manual, "jump", BridgeSystem.Now + BridgeSystem.Ticks(2000));
             if (!InWorld(out string err)) return Json.Error(err);
             if (!HasPlayer(out string perr)) return Json.Error(perr);
             if (!CanTick(out string perr2)) return Json.Error(perr2);
@@ -4411,7 +4570,7 @@ namespace DshTerrariaBridge
         private static string Use(JsonElement p)
         {
             BridgeSystem.StopWalk("manual-use");
-            BridgeSystem.GuardUntil = 0; BridgeSystem.GuardDefault = false;
+            BridgeSystem.GuardEngaged = false;   // 松手但不销毁 guard（见 Move 的注释）
             if (!InWorld(out string err)) return Json.Error(err);
             if (!HasPlayer(out string perr)) return Json.Error(perr);
             if (!CanTick(out string perr2)) return Json.Error(perr2);

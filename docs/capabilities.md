@@ -21,7 +21,7 @@
 |---|---|---|---|
 | 感知 | 角色/世界状态 | `state` | ✅ |
 | 感知 | 区域方块快照 | `scan {x,y,r,walls}` | ✅ |
-| 感知 | 找掉进去出不来的坑 | `findpit {x,y,r,minDepth}` | 🚧 代码已编译、测试已加，**未做真机验证** |
+| 感知 | 找掉进去出不来的坑 | `findpit {x,y,r,minDepth,openAbove}` | 🚧 代码已编译、测试已加，**未做真机验证** |
 | 感知 | 单格方块 | `tile {x,y}` | ✅ |
 | 感知 | 按类型找方块 | `find {type,x1,x2,y1,y2,max}` | ✅ |
 | 感知 | 附近生物 | `npc {r}` | ✅ |
@@ -171,10 +171,18 @@ minions,minionSlots,grapCount,hookType,mounted,wingTime,hasWings,itemAnimation,p
 
 **读地形必须看符号（或 `rows`/`tile` 的 `type`），不能把 `#` 一律当墙。** 以前所有非空格都画 `#`，树、平台、门和石墙长得一模一样：照图读会把整片树林当墙、把树干顶当成地表高度、把树间的空当成坑——同一条错判连续发生过三次（砍错树、误报 7~9 格落差、找不到脚边的坑）。
 
-### `findpit {x,y,r,minDepth}` — 找"掉进去出不来的坑"
-默认 `x/y` = 玩家位置，`r` = 24（≤48），`minDepth` = 6（裸跳约 5.5 格）。
+### `findpit {x,y,r,minDepth,openAbove}` — 找"掉进去出不来的坑"
+默认 `x/y` = 玩家位置，`r` = 24（≤48），`minDepth` = 6（裸跳约 5.5 格），`openAbove` = 6。
+
 判据全部用 `tileSolid`，不看形状：**连续空 ≥ minDepth + 下面有实心底 + 下半段至少一侧有 ≥ max(2, 深度/2) 格连续实心壁**；树/草/火把/平台按非实心处理，不算壁。
-返回 `{count, pits:[{x0,x1,center,depth,floorY,dist}]}`。为什么要有它：ascii 丢类型，树干会盖住坑口，靠读图找坑会连错。
+
+两个排除条件是踩出来的：
+- **封顶的不算坑**：井口上方连续空 < `openAbove` → 那是地下洞穴竖井，地表走不到。不加这条时，地表 28 格内报 0 个坑、48 格内报 5 个，全在地下 27~40 格处，一个都下不去。
+- **平台当底的不算坑**：坑底的方块是 `tileSolidTop` 且非 `tileSolid`（平台）→ 那是"站在上面的夹层"，会成片误报。
+
+返回 `{count, pits:[{x0,x1,center,topY,depth,floorY,dist,dy,reachableFromSurface}]}`，**按 `dist` 由近到远排序**。`dist` 是二维距离（`√(dx²+dy²)`）——只算水平距离会把地下 30 格的井报成"距 5 格"，于是"最近的坑"永远指向一个走不到的地方。
+
+为什么要有它：ascii 丢类型，树干会盖住坑口，靠读图找坑会连错。
 
 ### `tile {x,y}` — 单格详情
 `{hasTile,type,name,wall,liquid,slope,halfBlock,actuator,solid,solidTop,frameX,frameY}`。
@@ -243,7 +251,8 @@ flood fill 出房间空气格，逐项给 `walled / floorRatio / ceilRatio / lef
 | `moveto {x,ms}` | 位置闭环控制：读取原版位置/速度，按实测惯性距离提前松开方向键，必要时用反向原版输入修正 | 读 `state.exact`；只有 `active:false, stopReason:"arrived"` 且位置误差 ≤ 0.08 格、速度 ≤ 0.12 才算到位；`blocked` 表示连续 45 帧几乎不动 |
 | `jump {ms}` | 按住原版跳跃键输入（高度由按住时长和游戏物理决定）；脚底真在绳上时先按下脱绳，再开始跳跃 | 起跳/上台阶；控制证据看 `state.flagJump` |
 | `climb {dir,ms}` | **只在脚底真实绳格上**才生效；身体中段碰到绳不算挂绳 | `ropeContact.onRopeReal` 与 `tileFeetType` 先确认，再看纵坐标回读 |
-| `walkto {x,y,tol,ms}` | 走到坐标。内部是 **感知→决策→执行** 三层：每 tick 扫 8 列地面（落差/墙高/是否建材/是否门/是否坑），执行层只发方向/跳跃/右键交互输入。**出发前先验目标格**：不能站（身体被挡或脚下没地板）就直接拒绝并给出最近可站点，`force:true` 跳过校验 | 已能穿过自建房的关门（右键交互由原版处理）、跳过 1~6 格台阶、跨 ≤3 格坑；⚠️「地面→实心屋顶」这种组合仍需实机复测。目标不可站时 A* 只会回 `no-path`，看起来像"没路/被墙挡住"——实测因此把 8 格深的坑口当成走不过去 |
+| `walkto {x,y,tol,ms}` | 走到坐标。内部是 **感知→决策→执行** 三层：每 tick 扫 8 列地面（落差/墙高/是否建材/是否门/是否坑），执行层只发方向/跳跃/右键交互输入。**`mode` 给模糊目标**（结构照 Baritone Goal）：`block` 精确格 / `near` 附近 tol 内任意可站格 / `xz` 只要 x 对上 / `ylevel` 只要 y 对上 / `any`（配 `targets:[{x,y}]`，任一满足最近的赢）/ `away`（配 `minDist`，远离某点）。模糊目标先 `Resolve` 成一个真能站的格子再交给原 A*。`block` 且目标不可站时仍拒绝并给最近可站点，`force:true` 跳过 | 已能穿过自建房的关门（右键交互由原版处理）、跳过 1~6 格台阶、跨 ≤3 格坑；⚠️「地面→实心屋顶」这种组合仍需实机复测。目标不可站时 A* 只会回 `no-path`，看起来像"没路/被墙挡住"——实测因此把 8 格深的坑口当成走不过去，这正是要加 `mode` 的原因 |
+| `walkto` 的驱动权 | 启动前要 `Acquire(Path)`；手动键按着时返回 `ok:false` 并说明"被更高优先级占着"，不假启动。`state.drive` 能看谁在开车、谁被谁抢占 | 以前手动命令直接 `StopAutomatedMovement` 硬杀，命令回 ok 人却不动 |
 | `walkmode {mode}` | `legacy` / `reactive` / `new` 切换走路实现，用来同场景对比两套 | 回包带当前模式；层级为首次改动的隔离用 |
 | `path {x,y,ms,dig}` | A* 寻路（离线镜像 `src/path-model.js` 的 C# 版，四类边：走/跨/跳/落） | 失败时回 `why`（含起点终点是否可站、`opened` 计数）。⚠️ 兜底包围盒 ±10 |
 | `travelstatus` | 走路的实时内部状态（`active/stop/rule/kind/wp/lu/ru/greedy`） | 诊断"路点在左、控制却向右"这类问题的唯一手段 |

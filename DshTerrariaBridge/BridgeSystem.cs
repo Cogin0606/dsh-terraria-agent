@@ -1591,12 +1591,23 @@ namespace DshTerrariaBridge
             var next = PathCells[PathIndex];
             int dx = next.x - px, dy = next.y - py;
 
+            // 把这一步的判定输入留下来。诊断用：真机上有过一次"walkto 卡在
+            // 半砖旁边 6 秒、active:true 却不发方向键"，事后完全无法复盘到底哪个分支没进。
+            // 这里只记数，不改行为。
+            WalkDbgIndex = PathIndex; WalkDbgCells = PathCells.Count;
+            WalkDbgPx = px; WalkDbgPy = py; WalkDbgNextX = next.x; WalkDbgNextY = next.y; WalkDbgRise = py - next.y;
+
             // 优先水平推进：路径格常常只比人低一格（站在地板上），那不是"要往下挖"
             if (dx != 0)
             {
                 int sign = Math.Sign(dx);
                 // 只在“真被挡住”（位置连续几 tick 没变）时才挖：实测无条件挥镐会在自建房里把地板和墙刨掉。
                 bool blocked = !TileAir(px + sign, py) || !TileAir(px + sign, py + 1);
+                WalkDbgSign = sign;
+                WalkDbgBlocked = blocked;
+                WalkDbgAir0 = TileAir(px + sign, py) ? 1 : 0;
+                WalkDbgAir1 = TileAir(px + sign, py + 1) ? 1 : 0;
+                WalkDbgAir2 = TileAir(px + sign, py + 2) ? 1 : 0;
                 if (TileAir(px + sign, py + 2) && TileAir(px + sign, py + 3)) PlaceWalkBlock(px + sign, py + 2);
                 // 障碍处理顺序：先跳（1 格台阶跳过去就行）→ 还不行才动镐。
                 // 事故背景：原来的顺序是“看到挡路就先挥镐”，结果在自建房里把地板、墙和门一起刨了。
@@ -1673,12 +1684,29 @@ namespace DshTerrariaBridge
         private static int WalkLastPx, WalkStuck;
         internal static int WalkStuckTicks => WalkStuck;
 
-        internal static void BeginWalk(int x, int y, int tol, ulong until)
+        // 走路单步判定留痕（只读诊断）：卡住时能看到"当时路径第几格、下一格是哪个、
+        // 身体格 air 三位、rise 多少"。真机遇到过 active:true 却不发方向键的情况，
+        // 没有这组数完全无法复盘。
+        internal static int WalkDbgIndex, WalkDbgCells, WalkDbgPx, WalkDbgPy;
+        internal static int WalkDbgNextX, WalkDbgNextY, WalkDbgRise, WalkDbgSign;
+        internal static bool WalkDbgBlocked;
+        internal static int WalkDbgAir0, WalkDbgAir1, WalkDbgAir2;
+
+        internal static bool BeginWalk(int x, int y, int tol, ulong until)
         {
+            // 拿驱动权：手动键按着的时候不该启动自动走路（会互相覆盖键），
+            // 否则表现为"命令回了 ok，人却一动不动"。拿不到就明确回 false，不假启动。
+            if (!Acquire(Drive.Path, "walk", until))
+            {
+                WalkActive = false;
+                WalkStop = "preempted:" + DriveOwnerName;
+                return false;
+            }
             WalkActive = true; WalkX = x; WalkY = y;
             WalkTol = Math.Max(0, tol); WalkDeadline = until;
             WalkStop = ""; WalkNextJump = 0; WalkNextMine = 0; WalkStuck = 0; WalkLastPx = -99999;
             WalkRepaths = 0; WalkStuckHard = 0; WalkRepathSame = 0; WalkRepathPx = -99999; WalkHasWp = false; WalkWpX = 0; WalkWpY = 0; WalkDetour = 0;
+            return true;
         }
 
         internal static void StopWalk(string reason)
@@ -3725,6 +3753,81 @@ namespace DshTerrariaBridge
         internal static string EscapeStatus = "idle", EscapeReason = "";
         internal static bool GuardEngaged;
         internal static volatile bool HookHeld;
+
+        /* ── 驱动权仲裁（结构照 Baritone 的 BaritoneProcess + priority）────────
+         * 病根有两处：
+         *   ① 每条手动命令都调 StopAutomatedMovement() 把别的流程硬杀；
+         *   ② Move / Jump 还顺手把 guard 三连清零（GuardUntil / GuardDefault / GuardEngaged），
+         *      于是"走两步"= 永久关掉自动防守，表现出来就是怪贴脸还站着不动。
+         * 所以把"谁在开车"集中成一张优先级表：数字大的开车，低优先级让路但**不销毁**
+         * （不再清 GuardUntil），高优先级窗口过期后自动恢复。谁抢断了谁也记下来，
+         * 从 state.drive 能直接看到，不用再对着十几个 XXUntil 猜。
+         */
+        internal enum Drive : int { Idle = 0, Path = 30, Mine = 50, Combat = 70, Escape = 90, Manual = 100 }
+
+        internal static Drive DriveOwner = Drive.Idle;
+        internal static string DriveOwnerName = "";
+        internal static ulong DriveOwnerUntil;
+        private static readonly string[] PreemptLog = new string[4];
+        private static int PreemptLogCount;
+
+        /// <summary>当前真正开车的优先级；持有者窗口过期就当 Idle（不会卡在高优先级上）。</summary>
+        internal static Drive CurrentDrive()
+        {
+            if (DriveOwner != Drive.Idle && DriveOwnerUntil > 0 && Now > DriveOwnerUntil)
+                return Drive.Idle;
+            return DriveOwner;
+        }
+
+        /// <summary>这个优先级现在能动手吗。低优先级一律让路，但不会被销毁。</summary>
+        internal static bool CanRun(Drive p) => (int)p >= (int)CurrentDrive();
+
+        /// <summary>申请驱动权。false = 被更高优先级占着，调用方应当不动手。</summary>
+        internal static bool Acquire(Drive p, string name, ulong until)
+        {
+            Drive cur = CurrentDrive();
+            if ((int)p < (int)cur)
+            {
+                RecordPreempted((name ?? "?") + " 被 " + DriveOwnerName + " 挡住");
+                return false;
+            }
+            if ((int)p > (int)cur && cur != Drive.Idle)
+                RecordPreempted(DriveOwnerName + " 被 " + (name ?? "?") + " 抢占");
+            DriveOwner = p; DriveOwnerName = name ?? ""; DriveOwnerUntil = until;
+            return true;
+        }
+
+        internal static void ReleaseDrive(Drive p, string why)
+        {
+            if (DriveOwner != p) return;
+            DriveOwner = Drive.Idle; DriveOwnerName = why ?? ""; DriveOwnerUntil = 0;
+        }
+
+        private static void RecordPreempted(string line)
+        {
+            PreemptLog[PreemptLogCount % PreemptLog.Length] = Now + ":" + line;
+            PreemptLogCount++;
+        }
+
+        internal static object DriveStatus()
+        {
+            var recent = new List<string>();
+            int n = Math.Min(PreemptLogCount, PreemptLog.Length);
+            for (int i = PreemptLogCount - n; i < PreemptLogCount; i++)
+                recent.Add(PreemptLog[i % PreemptLog.Length]);
+            return new
+            {
+                owner = CurrentDrive().ToString(),
+                ownerRaw = DriveOwner.ToString(),
+                by = DriveOwnerName,
+                untilTick = DriveOwnerUntil,
+                manualHold = CanRun(Drive.Manual) && CurrentDrive() == Drive.Manual,
+                guardMayRun = CanRun(Drive.Combat),
+                escapeMayRun = CanRun(Drive.Escape),
+                preemptCount = PreemptLogCount,
+                preempted = recent.ToArray(),
+            };
+        }
         // 钩子弹幕朝**鼠标世界坐标**飞（原版用 Main.MouseWorld 算方向），不是朝 tileTargetX/Y。
         // 之前只 SetAim 不改鼠标，光标还停在别处，钩子永远没有合法落点。
         internal static Vector2 HookAimWorld;
@@ -3915,6 +4018,9 @@ namespace DshTerrariaBridge
             // 否则 guard 每帧把 controlLeft/Right 写回 false，手动 move/right/left 全部失效。
             if (UseUntil > now || UseTileUntil > now) return;
             if (LeftUntil > now || RightUntil > now || UpUntil > now || DownUntil > now) return;
+            // 上面两条是"按键还按着"的物理判据，保留；下面这条是"谁在开车"的语义判据。
+            // 两者都要：手动窗口还没结束但键已经松开时，仍然不该被 guard 抢走。
+            if (!CanRun(Drive.Combat)) return;
             // 不再自动续期：guard 只在命令给的时长内有效（用户要求删掉自动打怪）。
             if (GuardUntil <= now)
             {
@@ -4078,6 +4184,9 @@ namespace DshTerrariaBridge
                 return;
             }
             if (now < EscapeNextEval) return;
+            // 手动命令正在开车时不抢（人明确要求动，自救让路），但**不退出**：
+            // 手动窗口一过，自救接着跑。以前这里没有仲裁，escape 和 move 会互相踩键。
+            if (!CanRun(Drive.Escape)) return;
             EscapeNextEval = now + 25;   // 约 0.4 秒评估一次，够快也不烧帧
 
             int tx = (int)(p.Center.X / 16f), ty = (int)(p.Center.Y / 16f);

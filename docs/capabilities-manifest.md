@@ -47,7 +47,7 @@
 | `shop` | `npc` `shop` `npcType` `distance` |
 | `shopdebug` | `npc` `npcType` |
 | `shops` | `scanned` |
-| `state` | `inWorld` `version` `paused` `hasFocus` `bridge` `screen` `mouseWorld` `mouseTile` `talkNPC` `npcChatText` `npcShopIndex` `npcChatRelease` `talkInput` `world` `player` `ropeContact` `ropeRelease` `flagTick` `flagLeft` `flagRight` `flagUp` `flagDown` `flagJump` `flagIntentRight` `flagIntentJump` `flagRightUntilLive` `flagJumpUntilLive` `afterTick` `preTick` `preCtrlLeft` `preCtrlRight` `preCtrlUp` `preCtrlDown` `preCtrlJump` `preVelX` `afterCtrlLeft` `afterCtrlRight` `afterCtrlUp` `afterCtrlDown` `afterCtrlJump` `afterTrigLeft` `afterTrigRight` `afterTrigUp` `afterTrigDown` `afterTrigJump` `afterVelX` `prePhysicsTick` `prePhysicsUp` `prePhysicsDown` `prePhysicsHook` `prePhysicsMount` `prePhysicsReleaseMount` `prePhysicsUseItem` `prePhysicsUseTile` `postControlMount` `postReleaseMount` `mountUntil` `mountUntilLive` `mountFired` `inventoryUntil` `inventoryUntilLive` `inputDiag` `guard` `attack` `path` `walk` `exact` `input` `hint` |
+| `state` | `inWorld` `version` `paused` `hasFocus` `bridge` `screen` `mouseWorld` `mouseTile` `talkNPC` `npcChatText` `npcShopIndex` `npcChatRelease` `talkInput` `world` `player` `ropeContact` `ropeRelease` `flagTick` `flagLeft` `flagRight` `flagUp` `flagDown` `flagJump` `flagIntentRight` `flagIntentJump` `flagRightUntilLive` `flagJumpUntilLive` `afterTick` `preTick` `preCtrlLeft` `preCtrlRight` `preCtrlUp` `preCtrlDown` `preCtrlJump` `preVelX` `afterCtrlLeft` `afterCtrlRight` `afterCtrlUp` `afterCtrlDown` `afterCtrlJump` `afterTrigLeft` `afterTrigRight` `afterTrigUp` `afterTrigDown` `afterTrigJump` `afterVelX` `prePhysicsTick` `prePhysicsUp` `prePhysicsDown` `prePhysicsHook` `prePhysicsMount` `prePhysicsReleaseMount` `prePhysicsUseItem` `prePhysicsUseTile` `postControlMount` `postReleaseMount` `mountUntil` `mountUntilLive` `mountFired` `inventoryUntil` `inventoryUntilLive` `inputDiag` `guard` `attack` `drive` `path` `walk` `exact` `input` `hint` |
 | `talkclose` | `beforeTalkNPC` `talkNPC` `chatText` `npcShop` `closed` `note` |
 | `talkfocus` | `screen` |
 | `talkoption` | — |
@@ -110,7 +110,7 @@
 | `travel` | `stop` `dir` `distance` `ms` `dig` | — |
 | `unhook` | — | — |
 | `use` | `slot` `right` `ms` `x` `y` | — |
-| `walkto` | `x` `y` `force` `tol` `ms` `dig` | — |
+| `walkto` | `tol` `force` `mode` `searchR` `ms` `dig` `x` `y` | — |
 | `wall` | `x` `y` `type` `remove` `ms` | — |
 | `chest` | `action` `slot` `count` `invSlot` | — |
 | `escape` | `report` `action` `maxMs` | — |

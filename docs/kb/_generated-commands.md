@@ -30,7 +30,7 @@
 | `fields` | `type` `filter` |
 | `fill` | `x1` `y1` `x2` `y2` `type` |
 | `find` | `type` `x1` `x2` `y1` `y2` `max` |
-| `findpit` | `x` `y` `r` `minDepth` |
+| `findpit` | `x` `y` `r` `minDepth` `openAbove` |
 | `fly` | `ms` |
 | `follow` | `off` `player` `guard` `range` |
 | `grab` | `r` |
@@ -104,7 +104,7 @@
 | `use` | `slot` `right` `ms` `x` `y` |
 | `walkdiff` | — |
 | `walkmode` | `mode` |
-| `walkto` | `x` `y` `force` `tol` `ms` `dig` |
+| `walkto` | `tol` `force` `mode` `searchR` `ms` `dig` `x` `y` |
 | `wall` | `x` `y` `type` `remove` `ms` |
 
 ## DSH 插件工具（28 个）

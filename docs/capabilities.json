@@ -367,7 +367,8 @@
         "x",
         "y",
         "r",
-        "minDepth"
+        "minDepth",
+        "openAbove"
       ],
       "returns": [
         "center"
@@ -1344,6 +1345,7 @@
         "inputDiag",
         "guard",
         "attack",
+        "drive",
         "path",
         "walk",
         "exact",
@@ -1555,14 +1557,20 @@
       "name": "walkto",
       "kind": "act",
       "params": [
-        "x",
-        "y",
-        "force",
         "tol",
+        "force",
+        "mode",
+        "searchR",
         "ms",
-        "dig"
+        "dig",
+        "x",
+        "y"
       ],
       "returns": [
+        "already",
+        "goal",
+        "at",
+        "resolved",
         "target"
       ],
       "summary": ""
