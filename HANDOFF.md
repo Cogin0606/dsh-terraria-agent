@@ -7,7 +7,7 @@
 
 | 项 | 值 |
 |---|---|
-| 游戏 | tModLoader 1.4.4.9，路径 `D:\STEAM\steamapps\common\tModLoader` |
+| 游戏 | tModLoader 1.4.4.9，路径 `E:\Games\STEAM\steamapps\common\tModLoader`（**2026-11 从 `D:\STEAM` 搬到 E 盘**；`ModSources\tModLoader.targets` 里存的是绝对路径，搬家后必须改，否则编译报 `MSB4019: 找不到 tMLMod.targets`） |
 | 启动 | `dotnet\dotnet.exe tModLoader.dll`（工作目录就是上面那个） |
 | 桥端口 | `127.0.0.1:47777`（客户端） / `47778`（专用服务端，**只有 `save` 走这个**） |
 | 编译源 | `%USERPROFILE%\Documents\My Games\Terraria\tModLoader\ModSources\DshTerrariaBridge` |
@@ -28,7 +28,7 @@ cp -f "$REPO"/*.cs "$SYNC"/
 # 2) 编译
 "C:/Users/<你>/AppData/Local/Microsoft/dotnet/dotnet.exe" build "$SYNC/DshTerrariaBridge.csproj" -c Release
 # 3) 打包成 tmod（-eac 必须给，否则打出来是空壳）
-cd "D:/STEAM/steamapps/common/tModLoader"
+cd "E:/Games/STEAM/steamapps/common/tModLoader"
 ./dotnet/dotnet.exe tModLoader.dll -server -build "$SYNC" -eac "$SYNC/bin/Release/net8.0/DshTerrariaBridge.dll"
 # 4) 确认 tmod 大小合理（正常 ~170KB；只有几百字节就是空壳）
 # 5) 启动游戏，等 3~4 分钟加载，再用客户端连 47777

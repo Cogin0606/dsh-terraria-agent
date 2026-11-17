@@ -3990,13 +3990,23 @@ namespace DshTerrariaBridge
         private static bool EscapeInBounds(int x, int y)
             => x >= 0 && y >= 0 && x < Main.maxTilesX && y < Main.maxTilesY;
 
-        /// <summary>从当前位置出发、半径 r 内能靠"走+跳"到达多少格。用于判断"这地方变宽了没有"。</summary>
-        private static int EscapeReach(int cx, int cy, int r)
+        /// <summary>从当前位置出发、半径 r 内能靠"走"到达多少格，同时给出能到的最高点 minY。</summary>
+        private static int EscapeReach(int cx, int cy, int r) => EscapeProbeRoam(cx, cy, r, out _);
+
+        /// <summary>
+        /// BFS 探针：可达格数 + 能到达的最高点（minY，y 越小越高）。
+        /// minY 用来回答"掉下去以后能不能回到原来的高度"——就是 Baritone 里 GoalYLevel 那种判据，
+        /// 也是"这个落差是不是死局"的真正判据：深不重要，回不来才致命。
+        /// 注意：这里只建模走路与一格台阶（四邻 PathBodyFree），不建模跳跃，
+        /// 所以 minY 略微偏保守（真跳得上来的，这里可能算成上不来）。
+        /// </summary>
+        internal static int EscapeProbeRoam(int tx, int ty, int r, out int minY)
         {
-            if (!EscapeInBounds(cx, cy) || !PathBodyFree(cx, cy)) return 0;
+            minY = ty;
+            if (!EscapeInBounds(tx, ty) || !PathBodyFree(tx, ty)) return 0;
             var seen = new HashSet<long>();
             var q = new Queue<long>();
-            long start = ((long)cx << 32) | (uint)cy;
+            long start = ((long)tx << 32) | (uint)ty;
             seen.Add(start);
             q.Enqueue(start);
             int count = 0;
@@ -4004,12 +4014,13 @@ namespace DshTerrariaBridge
             {
                 long cur = q.Dequeue();
                 int x = (int)(cur >> 32), y = (int)(cur & 0xFFFFFFFFL);
+                if (y < minY) minY = y;
                 count++;
                 for (int d = 0; d < 4; d++)
                 {
                     int nx = x + (d == 0 ? 1 : d == 1 ? -1 : 0);
                     int ny = y + (d == 2 ? 1 : d == 3 ? -1 : 0);
-                    if (Math.Abs(nx - cx) > r || Math.Abs(ny - cy) > r) continue;
+                    if (Math.Abs(nx - tx) > r || Math.Abs(ny - ty) > r) continue;
                     long k = ((long)nx << 32) | (uint)ny;
                     if (seen.Contains(k)) continue;
                     if (!EscapeInBounds(nx, ny) || !PathBodyFree(nx, ny)) continue;
@@ -4021,7 +4032,7 @@ namespace DshTerrariaBridge
         }
 
         /// <summary>给命令层用的只读探针：同样的 BFS 可达格数，不启动自救。</summary>
-        internal static int EscapeProbeReach(int tx, int ty, int r) => EscapeReach(tx, ty, r);
+        internal static int EscapeProbeReach(int tx, int ty, int r) => EscapeProbeRoam(tx, ty, r, out _);
 
         /// <summary>从 (tx,ty) 沿 dir 连续有多少格身体能过（最多 max 格）。</summary>
         private static int EscapeRun(int tx, int ty, int dir, int max)

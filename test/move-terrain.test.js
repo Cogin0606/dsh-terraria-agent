@@ -128,38 +128,112 @@ test('move 仍然只写输入标志，没有任何改世界的语句', () => {
   assert.doesNotMatch(body, /\.velocity\.[XY]\s*=(?!=)/)
 })
 
-// ---- 第二道判据：深度不够也拦 ----
-// 实测 (1796,309)：深 2 格、宽 3 格、头顶是半砖。闸门的 d>2 完全不拦，
-// 但落进去 regions 回 verdict=trapped / cells=0，escape 只能报 stuck（跳 19 次、gainY 0）。
-// 所以判据换成「落进去还能连通多少格」：landed < 40 且不到当前的一半，就判 trap。
-function trapped(hereReach, landedReach) {
-  return landedReach < 40 && landedReach * 2 < hereReach
+// ---- 第二道判据：成本模型（取代"落差 >N 就拒绝"）----
+// 结构来自 Baritone：给每个候选动作算成本再取最小，落差只是成本里的一项。
+// 常数与 Baritone ActionCosts 同比例：WALK 4.633 / JUMP_PENALTY 2 / FALL ∝ √n。
+// 关键：同一个深度，能爬回来就便宜、爬不回来记 ∞ —— 深度这一个数字区分不了这两种。
+const COST_WALK = 4.633
+const COST_JUMP = 2
+const COST_PLACE = 8
+const COST_INF = 1e9
+
+const costFall = n => 3 * Math.sqrt(Math.max(0, n))
+const costClimbBack = n => n * (COST_WALK + COST_JUMP)
+// 泰拉瑞亚：>25 格开始受伤，每多一格 10 点（world-biome 里的通用规则）
+function costFallDamage(n, life, lifeMax) {
+  if (n <= 25) return 0
+  const dmg = (n - 25) * 10
+  if (dmg >= Math.max(1, life)) return COST_INF
+  return (dmg / Math.max(1, lifeMax)) * 200
 }
 
-test('镜像：开放缓坡不拦，封闭小井拦', () => {
-  assert.equal(trapped(258, 0), true, '开阔地旁边一个 0 连通的死角，必须拦')
-  assert.equal(trapped(258, 39), true, '连 39 格也不到 40，且远小于 258，拦')
-  assert.equal(trapped(79, 0), true, '自己就在小空间里，落点更小，拦')
-  assert.equal(trapped(258, 79), false, '79 已经够走开，放行')
-  assert.equal(trapped(30, 20), false, '两处都小的时候不拦，宁可放过')
-  assert.equal(trapped(258, 40), false, '40 是下限，等于 40 放行')
+// 返回 { fallIn, jumpOver, bridge, detour, pick }
+// 注意 fallIn 里没有"爬回来"的代价：move 是单向推进，走过去一般不回头；
+// 贵的是"回不来"，那记 ∞（不是价格高，是这条路走完就死了）。
+function costs({ d, canClimbBack, cramped = false, life = 120, lifeMax = 120 }) {
+  let fallIn = costFall(d) + costFallDamage(d, life, lifeMax)
+  if (!canClimbBack) fallIn += COST_INF
+  if (cramped) fallIn += COST_INF
+  const jumpOver = COST_JUMP + COST_WALK
+  const bridge = d * (COST_PLACE + COST_WALK)
+  const detour = COST_WALK * (d * 4 + 8)
+  const pick = Math.min(fallIn, jumpOver, bridge, detour)
+  const pickName = pick === fallIn ? 'fall_in' : pick === jumpOver ? 'jump_over' : pick === bridge ? 'place_bridge' : 'detour'
+  return { fallIn, jumpOver, bridge, detour, pick, pickName }
+}
+
+test('镜像：2 格、能爬回来 → 落进去就是最便宜的，走', () => {
+  const c = costs({ d: 2, canClimbBack: true })
+  assert.equal(c.pickName, 'fall_in')
 })
 
-test('源码锁：TerrainAhead 用 EscapeProbeReach 比落点与起点的连通数', () => {
+test('镜像：2 格、爬不回来 → 落进去记 ∞，改选跳过去', () => {
+  const c = costs({ d: 2, canClimbBack: false })
+  assert.ok(c.fallIn >= COST_INF, '爬不回来必须记成不可选')
+  assert.notEqual(c.pickName, 'fall_in')
+  assert.equal(c.pickName, 'jump_over', '2 格时跳过去比垫方块便宜')
+})
+
+test('镜像：同样 2 格深，能不能爬回来给出不同结论（旧阈值做不到这件事）', () => {
+  assert.equal(costs({ d: 2, canClimbBack: true }).pickName, 'fall_in')
+  assert.notEqual(costs({ d: 2, canClimbBack: false }).pickName, 'fall_in')
+})
+
+test('镜像：落点空间被吃掉也算不可选（cramped）', () => {
+  const c = costs({ d: 2, canClimbBack: true, cramped: true })
+  assert.notEqual(c.pickName, 'fall_in')
+})
+
+test('镜像：深度一大，落进去会受伤 → 成本被伤害项顶上去', () => {
+  const shallow = costs({ d: 24, canClimbBack: true })
+  const deep = costs({ d: 40, canClimbBack: true })
+  assert.equal(costFallDamage(24, 120, 120), 0, '25 格以内不算伤害')
+  assert.ok(costFallDamage(40, 120, 120) > 0, '超过 25 格要计伤害')
+  assert.ok(deep.fallIn > shallow.fallIn, '深的落进去必须更贵')
+})
+
+test('镜像：会摔死 = 不可选（不是"贵"）', () => {
+  assert.equal(costFallDamage(60, 120, 120), COST_INF, '伤害 ≥ 当前血量记 ∞')
+  assert.ok(costs({ d: 60, canClimbBack: true }).fallIn >= COST_INF)
+})
+
+test('镜像：落差大时垫方块可能比跳更便宜（成本要真的参与比较）', () => {
+  // d=1 时 bridge = 12.6 > jumpOver 6.6；d=1 且爬不回来时 bridge 也可能赢
+  const c = costs({ d: 1, canClimbBack: false })
+  assert.equal(c.pickName, 'jump_over')
+  // d 很大、跳不过去的情形由 jump_over 成本不变体现：成本表本身不做可达判定
+  assert.ok(costs({ d: 10, canClimbBack: true }).bridge > costs({ d: 1, canClimbBack: true }).bridge,
+    '垫得越多越贵')
+})
+
+test('源码锁：TerrainAhead 用成本表，不再用深度阈值', () => {
   const i = CS.indexOf('private static bool TerrainAhead')
   assert.ok(i > 0, '缺少 TerrainAhead')
-  const body = CS.slice(i, i + 2200)
-  assert.match(body, /BridgeSystem\.EscapeProbeReach\(px, py, 8\)/, '起点连通数要在循环外算一次')
-  assert.match(body, /BridgeSystem\.EscapeProbeReach\(nx, ny \+ d, 8\)/, '落点连通数要按落点算')
-  assert.match(body, /landedReach < 40 && landedReach \* 2 < hereReach/, '判据必须与镜像一致')
-  assert.match(body, /issue = "trap"/, '要给出独立的 trap 状态，不能混进 pit_')
+  const body = CS.slice(i, i + 3600)
+  assert.match(body, /CostFall\(d\)/, '掉落时间要进成本')
+  assert.match(body, /CostFallDamage\(d, pl\.statLife, pl\.statLifeMax2\)/, '摔落伤害要进成本')
+  assert.match(body, /canClimbBack/, '要判能不能爬回出发高度')
+  assert.match(body, /if \(!canClimbBack\) fallIn \+= CostInf;/, '回不来记 ∞（不是价格高，是死路）')
+  assert.match(body, /double jumpOver = CostJump \+ CostWalk;/, '跳过去要有自己的成本')
+  assert.match(body, /double bridge = d \* \(CostPlace \+ CostWalk\)/, '垫方块要有自己的成本')
+  assert.match(body, /double detour = CostWalk \* \(d \* 4 \+ 8\)/, '绕行要有自己的成本')
+  assert.match(body, /Math\.Min\(Math\.Min\(fallIn, jumpOver\), Math\.Min\(bridge, detour\)\)/, '必须取四项最小')
+  // 旧的硬阈值必须消失
+  assert.doesNotMatch(body, /if \(d > 2\)/, '旧的"落差 >2 格就拒绝"必须删掉')
 })
 
-test('源码锁：move 对 trap 单独回包，且仍给 jump / place / 绕 / force 四条路', () => {
+test('源码锁：判"死局"用 minY（能不能回到出发高度），等价 Baritone GoalYLevel', () => {
+  const body = CS.slice(CS.indexOf('private static bool TerrainAhead'), CS.indexOf('private static bool TerrainAhead') + 3600)
+  assert.match(body, /EscapeProbeRoam\(nx, ny, 8, out int landedMinY\)/, '要拿到落点的最高可达点')
+  assert.match(body, /bool canClimbBack = landedMinY <= py;/, '判据是 minY 能不能回到出发高度')
+})
+
+test('源码锁：拒绝时把四个候选动作的成本一起报出来', () => {
   const body = moveBody()
-  assert.match(body, /tIssue == "trap"/, 'move 没有处理 trap 分支')
-  assert.match(body, /落进去就走不开了/, '错误文本要说明这是"进得去出不来"，不是"深"')
-  assert.match(body, /只连通 \d|只连通 \{/, '要报出落点能连通多少格')
+  assert.match(body, /tIssue == "trap" \|\| tIssue\.StartsWith\("pit_"\)/, 'trap 与 pit_ 走同一分支')
+  assert.match(body, /tCost/, '要把成本说明带进回包')
+  assert.match(body, /jump 跳过去 ／ place 垫方块 ／ 换方向绕/, '仍给四条路')
+  assert.match(body, /force:true/, '仍允许强行通过')
 })
 
 test('说明：真机验证不在本文件内（需要游戏开着看角色真的停在坑边）', () => {

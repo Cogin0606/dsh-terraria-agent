@@ -4097,9 +4097,45 @@ namespace DshTerrariaBridge
         /// 返回 false 时 issue 是 blocked / pit_N_deep / pit_deep，
         /// reach = 安全走到的列数，drop = 那个断崖的落差格数。
         /// </summary>
-        private static bool TerrainAhead(Player pl, string dir, int steps, out int reach, out string issue, out int drop)
+        /* ── 移动代价模型 ────────────────────────────────────────────────────
+         * 结构照抄 Baritone 的 ActionCosts / Settings：给每个候选动作算成本再取最小，
+         * 落差只是成本里的一项，不是判据本身。为什么必须换掉"落差 > 2 格就拒绝"：
+         * 同一段地形，2 格深但能爬回来＝走过去没事，2 格深爬不回来＝死局
+         * （实测 (1796,309) regions 回 trapped / cells:0，escape 跳 19 次 gainY 恒 0）。
+         * 深度这一个数字区分不了这两种，成本能。
+         *
+         * 常数按泰拉瑞亚换算，但保留 Baritone 的相对比例，方便对着它的表核对：
+         *   WALK_ONE_BLOCK_COST 4.633 / SPRINT 3.564 / JUMP_PENALTY 2 / COST_HEURISTIC 3.563
+         */
+        private const double CostWalk = 4.633;    // 走一格
+        private const double CostJump = 2.0;      // 跳一次（Baritone JUMP_PENALTY）
+        private const double CostPlace = 8.0;     // 垫一块方块（掏方块 + 瞄准 + 等 ItemCheck）
+        private const double CostInf = 1e9;       // 不可选（Baritone COST_INF）
+
+        /// <summary>掉落时间成本。√n 的形状与 Baritone 的 FALL_N_BLOCKS_COST 一致（自由落体时间 ∝ √h）。</summary>
+        private static double CostFall(int n) => 3.0 * Math.Sqrt(Math.Max(0, n));
+
+        /// <summary>原路爬回去的代价：一格一格跳，每格 走 + 跳。
+        /// 注意：不直接加进 fallIn —— move 是单向推进，走过去一般不回头。
+        /// 它的用途是给"要不要为了回头而绕"这类判断留数值，以及解释 trap 为什么贵。</summary>
+        private static double CostClimbBack(int n) => n * (CostWalk + CostJump);
+
+        /// <summary>
+        /// 掉落伤害成本。泰拉瑞亚：落差 &gt; 25 格开始受伤，每多一格 10 点
+        /// （docs/kb/world-biome.md）。会死就记 COST_INF —— 那不是"贵"，是不能选。
+        /// </summary>
+        private static double CostFallDamage(int n, int life, int lifeMax)
         {
-            reach = 0; issue = "none"; drop = 0;
+            if (n <= 25) return 0;
+            double dmg = (n - 25) * 10.0;
+            if (dmg >= Math.Max(1, life)) return CostInf;
+            return dmg / Math.Max(1, lifeMax) * 200.0;   // 占满血多少，按比例折成成本
+        }
+
+        private static bool TerrainAhead(Player pl, string dir, int steps,
+            out int reach, out string issue, out int drop, out string costNote)
+        {
+            reach = 0; issue = "none"; drop = 0; costNote = null;
             int px = (int)(pl.Center.X / 16f), py = (int)(pl.Center.Y / 16f);
             int dx = dir == "right" ? 1 : -1;
             // 起点能连通多少格，用来跟落点比（只算一次，别在循环里重复 BFS）。
@@ -4120,22 +4156,47 @@ namespace DshTerrariaBridge
                         }
                     }
                     if (!found) { drop = 14; issue = "pit_deep"; return false; }
-                    // AGENTS §0.57：落差 >2 格且朝下＝悬崖，不许走过去；1~2 格人自己会走下去。
-                    if (d > 2) { drop = d; issue = "pit_" + d + "_deep"; return false; }
-                    // 深度不够也照样能是个出不去的小井：实测 (1796,309) 深 2 格、宽 3 格、头顶是半砖，
-                    // 落进去 regions 回 verdict=trapped / cells=0，escape 只能报 stuck。
-                    // 所以判据不看深度，看"落进去以后还能不能走开"。
-                    int landedReach = BridgeSystem.EscapeProbeReach(nx, ny + d, 8);
-                    if (landedReach < 40 && landedReach * 2 < hereReach)
-                    {
-                        drop = landedReach; issue = "trap"; return false;
-                    }
                     ny += d;
+                    drop = Math.Max(drop, d);
+
+                    // 落下去还能不能回到出发高度？—— 这才是"死局"的判据。
+                    int landedReach = BridgeSystem.EscapeProbeRoam(nx, ny, 8, out int landedMinY);
+                    bool canClimbBack = landedMinY <= py;
+                    // 落点比出发点还小一半，且爬不回来，就是新的 trap（逃生空间被吃掉）。
+                    bool cramped = landedReach < 40 && landedReach * 2 < hereReach;
+
+                    double fallIn = CostFall(d) + CostFallDamage(d, pl.statLife, pl.statLifeMax2);
+                    // 不把"爬回来"算进代价：move/walkto 是单向推进，走过去之后一般不回头。
+                    // 真正贵的是"回不来" —— 那不是成本高，是这条路走完就死了。
+                    if (!canClimbBack) fallIn += CostInf;
+                    if (cramped) fallIn += CostInf;
+
+                    double jumpOver = CostJump + CostWalk;              // 跳过去，不落
+                    double bridge = d * (CostPlace + CostWalk);         // 垫 d 块走过去
+                    double detour = CostWalk * (d * 4 + 8);             // 绕行的粗估
+
+                    double best = Math.Min(Math.Min(fallIn, jumpOver), Math.Min(bridge, detour));
+                    string cheapest = best == fallIn ? "fall_in"
+                        : best == jumpOver ? "jump_over"
+                        : best == bridge ? "place_bridge" : "detour";
+
+                    if (best == fallIn) continue;   // 落进去本来就是最便宜的，走
+
+                    costNote =
+                        $"落差 {d} 格：落进去 {Show(fallIn)}"
+                        + (canClimbBack ? "" : "（爬不回出发高度）")
+                        + (cramped ? $"（落点只连通 {landedReach} 格）" : "")
+                        + $" / 跳过去 {Show(jumpOver)} / 垫 {d} 块 {Show(bridge)} / 绕行 {Show(detour)}"
+                        + $" → 最便宜的是 {cheapest}";
+                    issue = !canClimbBack || cramped ? "trap" : "pit_" + d + "_deep";
+                    return false;
                 }
                 reach = i;
             }
             return true;
         }
+
+        private static string Show(double cost) => cost >= CostInf ? "∞（不可选）" : cost.ToString("0.0");
 
         private static string Move(JsonElement p)
         {
@@ -4177,20 +4238,20 @@ namespace DshTerrariaBridge
                 int lookAhead = tiles > 0
                     ? Math.Clamp((int)Math.Ceiling(tiles) + 1, 3, 24)
                     : Math.Clamp(ms / 200, 3, 12);
-                if (!TerrainAhead(P, dir, lookAhead, out int reach, out string tIssue, out int tDrop))
+                if (!TerrainAhead(P, dir, lookAhead, out int reach, out string tIssue, out int tDrop, out string tCost))
                 {
-                    if (tIssue.StartsWith("pit_"))
+                    if (tIssue == "trap" || tIssue.StartsWith("pit_"))
                     {
+                        // 不再一句"落差 N 格"了事：把四个候选动作的成本一起摆出来，
+                        // 让调用方看见"为什么"（Baritone 的 cost 表也是这么用的）。
+                        string what = tIssue == "trap"
+                            ? "落进去就回不到出发高度（或落脚空间被吃掉），是死局"
+                            : $"落差 {tDrop} 格，掉下去不划算";
                         return Json.Error(
-                            $"前方第 {reach + 1} 列是 {tDrop} 格深的落差，这一步（{dir} {ms}ms）会一路走进去摔下去。" +
-                            "可选：jump 跳过去 ／ 换方向绕 ／ place 搭桥；确认要走就传 force:true。");
-                    }
-                    if (tIssue == "trap")
-                    {
-                        return Json.Error(
-                            $"前方第 {reach + 1} 列的落脚点落进去就走不开了：从那里只连通 {tDrop} 格。" +
-                            "落差不大，但四周封死／头顶有盖，掉进去跳不出来。" +
-                            "可选：jump 跳过去 ／ place 垫路 ／ 换方向绕；确认要走就传 force:true。");
+                            $"前方第 {reach + 1} 列：{what}。"
+                            + (tCost == null ? "" : tCost + "。")
+                            + "可选：jump 跳过去 ／ place 垫方块 ／ 换方向绕；确认要走就传 force:true。",
+                            new { columnAhead = reach + 1, dir, drop = tDrop, issue = tIssue, cost = tCost });
                     }
                     terrainNote = $"前方第 {reach + 1} 列被挡（{tIssue}），走到那里会停住";
                 }

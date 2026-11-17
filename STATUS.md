@@ -306,7 +306,7 @@ test/                  330 项测试（328 通过，2 项主机差异跳过）
 
 ## 八、当前状态与下一步
 
-**环境**：tModLoader 1.4.4.9（`D:/STEAM/steamapps/common/tModLoader`），桥 `127.0.0.1:47777`，
+**环境**：tModLoader 1.4.4.9（`E:/Games/STEAM/steamapps/common/tModLoader`，2026-11 从 D 盘搬来），桥 `127.0.0.1:47777`，
 **必须用多人模式（开服并开始游戏）** —— 单人模式一失焦就 `paused`，所有动作命令拿到 `moved:false`；
 Host & Play 下 `paused:false` 与 `hasFocus:false` 能同时成立，后台发输入就是真实输入。
 
